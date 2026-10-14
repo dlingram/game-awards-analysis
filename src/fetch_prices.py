@@ -4,6 +4,7 @@ parent company in data/clean/parent_companies.csv.
 Run from the project root:
     python -m src.fetch_prices            # download everything
     python -m src.fetch_prices --dry-run  # just list what would be downloaded
+    python -m src.fetch_prices --only EA WBD  # re-download some stocks, merge into existing file
 
 Outputs (data/raw/prices/):
     prices_daily.csv      date, ticker, open, high, low, close, adj_close, volume
@@ -20,7 +21,7 @@ import pandas as pd
 
 from src.config import CLEAN, RAW
 
-START = "2014-06-01"  # six months before the first ceremony (Dec 2014)
+START = "2013-06-01"  # >1 year before the first ceremony (Dec 2014): the market model needs ~250 trading days of history
 END = pd.Timestamp.today().strftime("%Y-%m-%d")
 OUT = RAW / "prices"
 
@@ -46,12 +47,16 @@ FALLBACKS = {
     # Delisted US stocks: Tiingo keeps their history (free key, read from .env)
     "ATVI": [("tiingo", "atvi")],
     "TWX": [("tiingo", "twx")],
+    "EA": [("tiingo", "ea")],    # taken private Aug 2026; Yahoo dropped its history
+    "WBD": [("tiingo", "wbd")],  # acquired by Paramount Skydance Oct 2026
     "WIG20": [("yahoo", "^WIG20"), ("stooq", "wig20"),
               ("yahoo", "EPOL")],  # EPOL = iShares MSCI Poland ETF (USD) as last resort
 }
 # Delisted non-US stocks with no free source; excluded from the stock analysis
 # (CDM.L: 4 nominations, THUNDR.ST: 2 nominations). See reports/data_dictionary.md.
-KNOWN_GAPS = {"CDM.L", "THUNDR.ST"}
+KNOWN_GAPS = {"CDM.L", "THUNDR.ST", "DEVO.L"}  # DEVO.L: went private Sep 2026, 14 nominations
+# Delisted tickers where Yahoo's remaining data is unusable: go straight to the fallback
+SKIP_YAHOO = {"ATVI", "TWX", "EA", "WBD", "WIG20"}
 
 
 def tiingo_key() -> str:
@@ -119,7 +124,7 @@ def fetch_stooq(symbol: str) -> pd.DataFrame:
 
 def fetch_any(symbol: str) -> tuple[pd.DataFrame, str]:
     """Try Yahoo, then any fallbacks. Returns (data, 'source:symbol' actually used)."""
-    attempts = [] if symbol == "WIG20" else [("yahoo", symbol)]
+    attempts = [] if symbol in SKIP_YAHOO else [("yahoo", symbol)]
     attempts += FALLBACKS.get(symbol, [])
     source_fn = {"yahoo": fetch, "stooq": fetch_stooq, "tiingo": fetch_tiingo}
     for source, sym in attempts:
@@ -144,7 +149,19 @@ def fetch(symbol: str) -> pd.DataFrame:
                 return pd.DataFrame()
             time.sleep(2)
     if df.empty:
-        return df
+        # Yahoo sometimes returns nothing when START is before the listing date, or when it
+        # throttles a long run: wait, then ask for the full history and trim it ourselves.
+        time.sleep(3)
+        try:
+            df = yf.Ticker(symbol).history(period="max", auto_adjust=False, actions=False)
+        except Exception:
+            return pd.DataFrame()
+        if df.empty:
+            return df
+        idx = df.index.tz_localize(None) if df.index.tz is not None else df.index
+        df = df[(idx >= pd.Timestamp(START)) & (idx <= pd.Timestamp(END))]
+        if df.empty:
+            return df
     df = df.reset_index().rename(columns={"Date": "date", "Open": "open", "High": "high",
                                           "Low": "low", "Close": "close",
                                           "Adj Close": "adj_close", "Volume": "volume"})
@@ -155,6 +172,8 @@ def fetch(symbol: str) -> pd.DataFrame:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--only", nargs="+", metavar="TICKER",
+                    help="re-download just these stocks and merge them into prices_daily.csv")
     args = ap.parse_args()
 
     parents_path = CLEAN / "parent_companies.csv"
@@ -163,6 +182,8 @@ def main() -> None:
     parents = pd.read_csv(parents_path, encoding="utf-8-sig", keep_default_na=False)
 
     tickers = sorted(parents.ticker.unique())
+    expected_start = {r.ticker: max(pd.Timestamp(START), pd.Timestamp(r.listed_from or START))
+                      for r in parents.itertuples()}
     currencies = sorted(set(parents.currency) - {"USD"})
     fx_symbols = {c: f"{c}USD=X" for c in currencies}
     benchmarks = sorted({EXCHANGE_BENCHMARK[e] for e in parents.exchange})
@@ -181,14 +202,40 @@ def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     log, prices, fx, bms = [], [], [], []
 
+
     def record(kind, symbol, df, used=""):
         status = "ok" if len(df) else "NO DATA"
+        exp = expected_start.get(symbol)
+        if len(df) and exp is not None and pd.Timestamp(df.date.min()) > exp + pd.Timedelta(days=60):
+            status = "PARTIAL"  # history starts much later than the listing -> source dropped data
         log.append({"kind": kind, "symbol": symbol, "source_used": used or f"yahoo:{symbol}",
                     "rows": len(df),
                     "first_date": df.date.min() if len(df) else "",
                     "last_date": df.date.max() if len(df) else "", "status": status})
         note = f"  (via {used})" if used and used != f"yahoo:{symbol}" else ""
+        if status == "PARTIAL":
+            note += f"  starts {df.date.min()}, expected ~{exp.date()}"
         print(f"  {kind:9} {symbol:13} {len(df):5} rows  {status}{note}")
+
+    if args.only:
+        unknown = sorted(set(args.only) - set(tickers))
+        if unknown:
+            sys.exit(f"Not in parent_companies.csv: {unknown}")
+        old = pd.read_csv(OUT / "prices_daily.csv")
+        old_log = pd.read_csv(OUT / "download_log.csv")
+        for t in args.only:
+            df, used = fetch_any(t)
+            record("stock", t, df, used)
+            if len(df):
+                prices.append(df.assign(ticker=t))
+        got = {p.ticker.iloc[0] for p in prices}
+        new = pd.concat([old[~old.ticker.isin(got)]] + prices)
+        new[["date", "ticker", "open", "high", "low", "close", "adj_close", "volume"]].to_csv(
+            OUT / "prices_daily.csv", index=False)
+        log_df = pd.concat([old_log[~old_log.symbol.isin(args.only)], pd.DataFrame(log)])
+        log_df.to_csv(OUT / "download_log.csv", index=False)
+        print(f"\nMerged {len(got)} of {len(args.only)} into prices_daily.csv")
+        return
 
     for t in tickers:
         if t in KNOWN_GAPS:
@@ -231,6 +278,9 @@ def main() -> None:
     log_df.to_csv(OUT / "download_log.csv", index=False)
 
     bad = log_df[log_df.status != "ok"]
+    partial = log_df[log_df.status == "PARTIAL"]
+    if len(partial):
+        print("PARTIAL history (source dropped older data):", ", ".join(partial.symbol))
     print(f"\nDone. {len(log_df) - len(bad)} of {len(log_df)} symbols downloaded "
           f"({len(KNOWN_GAPS)} known gaps skipped: {', '.join(sorted(KNOWN_GAPS))}).")
     if len(bad):
