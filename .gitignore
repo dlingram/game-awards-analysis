@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.env
+.DS_Store
+
+# Raw / large data (keep folders via .gitkeep)
+data/raw/*
+data/clean/*.parquet
+!data/raw/.gitkeep
+!data/clean/.gitkeep
+
+# Dashboard temp files
+*.tmp
+~$*

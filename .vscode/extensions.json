@@ -1,0 +1,12 @@
+{
+  "recommendations": [
+    "ms-python.python",
+    "ms-python.vscode-pylance",
+    "ms-toolsai.jupyter",
+    "charliermarsh.ruff",
+    "github.copilot",
+    "github.copilot-chat",
+    "mechatroner.rainbow-csv",
+    "tamasfe.even-better-toml"
+  ]
+}
